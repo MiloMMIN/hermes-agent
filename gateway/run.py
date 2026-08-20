@@ -777,6 +777,88 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+_WORKBUDDY_TOOL_FENCE_RE = re.compile(
+    r"(?im)^\s*```(?:tool_calls?|function_calls?)\s*[\s\S]*?^\s*```\s*\n?"
+)
+_WORKBUDDY_TOOL_RESULT_MARKER_RE = re.compile(
+    r"(?im)^\s*\[tool\s+(?:result|call)\b[^\n]*\n?"
+)
+_WORKBUDDY_TOOL_XML_RE = re.compile(
+    r"(?is)<(?:tool_calls?|function_calls?)\b[^>]*>.*?</(?:tool_calls?|function_calls?)>\s*"
+)
+_WORKBUDDY_TOOL_RESULT_KEYS = frozenset({
+    "output", "exit_code", "cwd", "error", "status", "success", "returncode", "stderr",
+})
+_WORKBUDDY_PROGRESS_NARRATION_RE = re.compile(
+    r"(?i)^\s*(?:"
+    r"马上|我(?:先|来|会|正在)|让我|先(?:查|用|读取|解析|检查)|正在|改用|尝试|调用|执行"
+    r"|wttr(?:\.in)?|web_search|execute_code|terminal"
+    r").{0,300}$"
+)
+
+
+def _is_workbuddy_tool_result_envelope(value: Any) -> bool:
+    """Return whether a JSON object is an internal command/tool result."""
+    if not isinstance(value, dict):
+        return False
+    keys = set(value)
+    return "output" in keys and bool(keys & (_WORKBUDDY_TOOL_RESULT_KEYS - {"output"}))
+
+
+def _strip_workbuddy_tool_trace_echoes(text: str) -> str:
+    """Remove WorkBuddy's textual tool protocol without touching ordinary JSON."""
+    trace_seen = False
+    # A model sometimes writes a one-line "I will call X" immediately before
+    # the fence. That is intermediate reasoning, never a finished chat reply.
+    for match in reversed(list(_WORKBUDDY_TOOL_FENCE_RE.finditer(text))):
+        trace_seen = True
+        start = match.start()
+        paragraph_start = text.rfind("\n\n", 0, start)
+        candidate_start = 0 if paragraph_start < 0 else paragraph_start + 2
+        candidate = text[candidate_start:start].strip()
+        if candidate and _WORKBUDDY_PROGRESS_NARRATION_RE.fullmatch(candidate):
+            start = candidate_start
+        text = text[:start] + text[match.end():]
+
+    text, marker_count = _WORKBUDDY_TOOL_RESULT_MARKER_RE.subn("", text)
+    trace_seen = trace_seen or marker_count > 0
+    text, xml_count = _WORKBUDDY_TOOL_XML_RE.subn("", text)
+    trace_seen = trace_seen or xml_count > 0
+    if not trace_seen:
+        return text
+
+    # Tool-result envelopes can be compact, pretty-printed, or adjacent to
+    # prose. JSONDecoder lets us remove only recognised execution shapes,
+    # rather than a broad brace regex that would damage a legitimate answer.
+    decoder = json.JSONDecoder()
+    cleaned: list[str] = []
+    cursor = 0
+    while True:
+        start = text.find("{", cursor)
+        if start < 0:
+            cleaned.append(text[cursor:])
+            break
+        try:
+            value, length = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            cleaned.append(text[cursor:start + 1])
+            cursor = start + 1
+            continue
+        if _is_workbuddy_tool_result_envelope(value):
+            cleaned.append(text[cursor:start])
+            cursor = start + length
+            continue
+        cleaned.append(text[cursor:start + 1])
+        cursor = start + 1
+    text = "".join(cleaned)
+
+    lines = [
+        line for line in text.splitlines()
+        if not _WORKBUDDY_PROGRESS_NARRATION_RE.fullmatch(line.strip())
+    ]
+    return "\n".join(lines)
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -804,6 +886,24 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     from agent.message_sanitization import _sanitize_surrogates
 
     text = _sanitize_surrogates(str(text))
+
+    # WorkBuddy's text-protocol bridge can occasionally echo the tool history
+    # back as assistant prose.  These records are internal execution traces,
+    # not an answer for chat users.  Keep this narrowly scoped to the two
+    # affected adapters and preserve ordinary Markdown/code in final replies.
+    try:
+        from gateway.config import Platform
+        if platform in {Platform.WEIXIN, Platform.FEISHU}:
+            import re
+            text = _strip_workbuddy_tool_trace_echoes(text)
+            text = re.sub(
+                r"(?im)^\s*(?:TOOL_CALL|tool_call)\s*:\s*\{[^\n]*\}\s*\n?",
+                "",
+                text,
+            )
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    except Exception:
+        pass
 
     # Cancellation metadata, not assistant prose. ACP/TUI already suppress
     # this sentinel; chat surfaces should too (#7921).
@@ -4628,6 +4728,21 @@ class TurnRunner:
 
     async def send_progress_messages(self):
         ctx = self._ctx
+        # WeChat and Feishu must be final-answer-only surfaces.  Keep this
+        # guard at the delivery boundary as well as the turn configuration:
+        # it protects against stale queues and profile/plugin overrides that
+        # may have enabled progress before the current turn was constructed.
+        _progress_platform = getattr(ctx.source.platform, "value", ctx.source.platform)
+        if _progress_platform in {"weixin", "feishu"}:
+            if ctx.progress_queue:
+                while True:
+                    try:
+                        ctx.progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
+            return
         if not ctx.progress_queue:
             return
 
@@ -11858,6 +11973,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
             content = row["content"]
+            # Recovery rows were persisted before the normal delivery
+            # sanitizer necessarily ran.  Apply the same channel-specific
+            # filtering before adding the duplicate marker, otherwise a
+            # restart can re-emit stale WorkBuddy tool traces verbatim.
+            content = _sanitize_gateway_final_response(platform, content)
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
             metadata = (
@@ -27874,11 +27994,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and platform_key in _legacy_tp_overrides
             )
         )
+        # ``off`` is an explicit value.  Do not use truthiness here: a
+        # configured false/off value must not fall through to the noisy
+        # ``all`` default (the old expression made display.tool_progress:
+        # false ineffective for gateway sessions).
         progress_mode = (
             _env_tp
             if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
+            else (_resolved_tp if _resolved_tp is not None else (_env_tp or "all"))
         )
+        from gateway.config import Platform
+        # WeChat iLink and Feishu are permanent-message channels.  Never leak
+        # transient tool/thinking traces there, even when a multiplexed profile
+        # carries an older global ``tool_progress: all`` setting.
+        if source.platform in {Platform.WEIXIN, Platform.FEISHU}:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -27924,7 +28054,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
-        from gateway.config import Platform
         tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
@@ -27967,6 +28096,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
+        if source.platform in {Platform.WEIXIN, Platform.FEISHU}:
+            _thinking_enabled = False
         # Slack-native task cards (#29483): when the Slack adapter's opt-in
         # is set, tool progress renders as native plan/task cards via
         # chat.startStream — the progress queue is needed even though Slack

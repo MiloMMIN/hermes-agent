@@ -24,6 +24,42 @@ CHAT_PLATFORMS = [
     "feishu",
 ]
 
+
+def test_weixin_and_feishu_drop_workbuddy_tool_trace_echoes():
+    raw = (
+        "先说明结果。\n\n"
+        "[tool result call_1] {\"output\": \"secret trace\"}\n\n"
+        "```TOOL_CALL\n{\"name\":\"terminal\"}\n```\n\n"
+        "最终结论。"
+    )
+    for platform in (Platform.WEIXIN, Platform.FEISHU):
+        cleaned = _sanitize_gateway_final_response(platform, raw)
+        assert cleaned == "先说明结果。\n最终结论。"
+
+
+def test_weixin_and_feishu_drop_tool_result_envelope_and_progress_narration():
+    raw = (
+        "马上查今天温州天气。\n\n"
+        "```tool_call\n"
+        '{"id":"weather_1","name":"terminal","arguments":{"command":"wttr.in"}}\n'
+        "```\n"
+        '{"output":"WTTR_FAIL","exit_code":0,"error":null,"cwd":"C:\\\\Users\\\\MING"}\n\n'
+        "wttr.in 连不上，改用 web_search。"
+    )
+    for platform in (Platform.WEIXIN, Platform.FEISHU):
+        assert _sanitize_gateway_final_response(platform, raw) == ""
+
+
+def test_weixin_and_feishu_keep_normal_json_answers():
+    raw = '天气数据：{"city":"温州","temperature_c":31,"condition":"多云"}'
+    for platform in (Platform.WEIXIN, Platform.FEISHU):
+        assert _sanitize_gateway_final_response(platform, raw) == raw
+
+
+def test_other_platforms_keep_markdown_tool_like_text():
+    raw = "[tool result call_1]\n```TOOL_CALL\n{}\n```"
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, raw) == raw
+
 NOISY_STATUS_MESSAGES = [
     "🗜️ Preflight compression check before sending...",
     (

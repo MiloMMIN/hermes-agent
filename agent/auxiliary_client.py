@@ -7074,11 +7074,18 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     )
 
 
-_VISION_AUTO_PROVIDER_ORDER = (
-    "openrouter",
-    "nous",
-    "deepinfra",
-)
+_VISION_AUTO_PROVIDER_ORDER = ()
+
+# User-configured vision fallback providers, tried in order after the main
+# provider fails. Each entry is (provider_key, vision_model). The model must
+# be vision-capable on that provider's endpoint.
+_VISION_FALLBACK_PROVIDERS: List[Tuple[str, str]] = [
+    ("zai", "glm-5v-turbo"),
+    ("dqy-特价", "gpt-5.6-terra"),
+    ("dqy-低价", "gpt-5.6-sol"),
+    ("dqy-pro", "gpt-5.6-sol"),
+    ("ai-pixel", "gpt-5.6-luna"),
+]
 
 
 def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
@@ -7372,14 +7379,27 @@ def resolve_vision_provider_client(
                     return _finalize(
                         main_provider, rpc_client, rpc_model or vision_model)
 
-        # Fall back through aggregators (uses their dedicated vision model,
-        # not the user's main model) when main provider has no client.
-        for candidate in _VISION_AUTO_PROVIDER_ORDER:
-            if candidate == main_provider:
+        # Fall back through user-configured vision providers when main
+        # provider has no client. Each entry is (provider, model) — the
+        # model must be vision-capable; _resolve_strict_vision_backend
+        # only handles built-in aggregators, so custom providers go
+        # through resolve_provider_client directly.
+        for candidate_provider, candidate_model in _VISION_FALLBACK_PROVIDERS:
+            if candidate_provider == main_provider:
                 continue  # already tried above
-            sync_client, default_model = _resolve_strict_vision_backend(candidate)
-            if sync_client is not None:
-                return _finalize(candidate, sync_client, default_model)
+            if candidate_provider in _VISION_AUTO_PROVIDER_ORDER:
+                sync_client, default_model = _resolve_strict_vision_backend(
+                    candidate_provider, candidate_model
+                )
+                if sync_client is not None:
+                    return _finalize(candidate_provider, sync_client, default_model)
+            else:
+                client, final_model = resolve_provider_client(
+                    candidate_provider, candidate_model, is_vision=True,
+                    api_mode=resolved_api_mode, main_runtime=runtime,
+                )
+                if client is not None:
+                    return _finalize(candidate_provider, client, final_model)
 
         logger.debug("Auxiliary vision client: none available")
         return None, None, None

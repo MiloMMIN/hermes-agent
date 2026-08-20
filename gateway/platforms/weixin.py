@@ -103,13 +103,13 @@ EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
 
 LONG_POLL_TIMEOUT_MS = 35_000
-API_TIMEOUT_MS = 15_000
-CONFIG_TIMEOUT_MS = 10_000
+API_TIMEOUT_MS = 8_000
+CONFIG_TIMEOUT_MS = 8_000
 QR_TIMEOUT_MS = 35_000
 
-MAX_CONSECUTIVE_FAILURES = 3
-RETRY_DELAY_SECONDS = 2
-BACKOFF_DELAY_SECONDS = 30
+MAX_CONSECUTIVE_FAILURES = 2
+RETRY_DELAY_SECONDS = 0.5
+BACKOFF_DELAY_SECONDS = 8
 SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
@@ -1200,14 +1200,14 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("cdn_base_url") or _wx_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
         ).strip().rstrip("/")
         self._send_chunk_delay_seconds = float(
-            extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
+            extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "0.3")
         )
         self._send_chunk_retries = int(
-            extra.get("send_chunk_retries") or os.getenv("WEIXIN_SEND_CHUNK_RETRIES", "4")
+            extra.get("send_chunk_retries") or os.getenv("WEIXIN_SEND_CHUNK_RETRIES", "1")
         )
         self._send_chunk_retry_delay_seconds = float(
             extra.get("send_chunk_retry_delay_seconds")
-            or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
+            or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "0.3")
         )
         self._send_text_gate = asyncio.Lock()
         self._rate_limit_circuit_threshold = max(
@@ -1223,7 +1223,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         self._rate_limit_circuit_open_seconds = float(
             extra.get("rate_limit_circuit_open_seconds")
-            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "30.0")
+            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "10.0")
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
@@ -1252,10 +1252,10 @@ class WeixinAdapter(BasePlatformAdapter):
         # ``gateway.platforms.weixin.extra.text_batch_delay_seconds`` /
         # ``text_batch_split_delay_seconds``.
         self._text_batch_delay_seconds = self._coerce_float_extra(
-            "text_batch_delay_seconds", 3.0
+            "text_batch_delay_seconds", 0.5
         )
         self._text_batch_split_delay_seconds = self._coerce_float_extra(
-            "text_batch_split_delay_seconds", 5.0
+            "text_batch_split_delay_seconds", 1.5
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}

@@ -231,6 +231,18 @@ _OVERLOADED_PATTERNS = [
     "over capacity",
 ]
 
+# Patterns that indicate a TPM (tokens-per-minute) budget is exhausted — not
+# a per-credential rate limit or credential problem.  The credential is
+# valid; the provider's token quota for the current minute is spent.
+# Rotating credentials cannot help (the budget is account/provider-level,
+# shared across all keys), so on a 429 these must take the
+# upstream_rate_limit path: conversation_loop's pool_may_recover gate then
+# skips credential-pool rotation and goes straight to model fallback.
+_TPM_LIMIT_PATTERNS = [
+    "tpm limit exceeded",
+    "governance.tpm_limit_exceeded",
+]
+
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
 _USAGE_LIMIT_PATTERNS = [
     "usage limit",
@@ -1284,6 +1296,21 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # TPM (tokens-per-minute) budget exhausted — the credential is valid
+        # but the provider's token quota for this window is spent.  The
+        # budget is account/provider-level and shared across keys, so
+        # credential-pool rotation cannot help.  Map to
+        # FailoverReason.upstream_rate_limit so conversation_loop's
+        # pool_may_recover gate skips rotation and falls back to a different
+        # model immediately, instead of exhausting the pool over an
+        # account-wide token limit.
+        if any(p in error_msg for p in _TPM_LIMIT_PATTERNS):
+            return result_fn(
+                FailoverReason.upstream_rate_limit,
+                retryable=True,
+                should_rotate_credential=False,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,

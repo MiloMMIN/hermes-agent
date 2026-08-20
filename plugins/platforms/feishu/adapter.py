@@ -1326,9 +1326,26 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
 
+    class _LoopProxy:
+        """Forward every attribute access to the current thread's event loop.
+
+        The lark_oapi SDK stores a module-level ``loop`` and uses it inside
+        ``Client.start()``, ``_connect()`` and ``_receive_message_loop()``.
+        In multiplex mode several adapters run in different threads; a single
+        global loop pointer gets overwritten by whichever adapter started last,
+        leaving the others unable to receive events. This proxy resolves the
+        loop on every access, so each adapter effectively uses its own thread
+        loop without modifying the SDK source.
+        """
+
+        __slots__ = ()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(asyncio.get_event_loop(), name)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    ws_client_module.loop = loop
+    ws_client_module.loop = _LoopProxy()
     adapter._ws_thread_loop = loop
 
     original_connect = ws_client_module.websockets.connect
@@ -4475,12 +4492,22 @@ class FeishuAdapter(BasePlatformAdapter):
                 if mention_open_id == self._bot_open_id:
                     return True
                 continue  # IDs differ — not the bot; skip name fallback.
+            if mention_open_id and not self._bot_open_id:
+                # Bot's open_id is unknown (e.g. hydration failed or env var
+                # not set). Cannot confirm via open_id, but also cannot rule
+                # out a name match — fall through to user_id / name checks.
+                pass
             if mention_user_id and self._bot_user_id:
                 if mention_user_id == self._bot_user_id:
                     return True
                 continue
+            if mention_user_id and not self._bot_user_id:
+                # Same as above: can't confirm via user_id, keep checking name.
+                pass
             if self._bot_name and mention_name == self._bot_name:
                 return True
+            # If neither side has any identifiable credential, we cannot
+            # confidently say this is a mention of us; continue to next mention.
 
         return False
 
